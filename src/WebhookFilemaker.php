@@ -1,4 +1,5 @@
 <?php
+
 namespace craftyfm\craftformiefilemaker;
 
 use Craft;
@@ -6,11 +7,16 @@ use craft\helpers\Json;
 use craft\helpers\UrlHelper;
 use GuzzleHttp\Client;
 use Throwable;
-use verbb\formie\Formie;
+use Twig\Error\LoaderError;
+use Twig\Error\RuntimeError;
+use Twig\Error\SyntaxError;
 use verbb\formie\base\Integration;
 use verbb\formie\base\Webhook;
 use verbb\formie\elements\Submission;
+use verbb\formie\errors\IntegrationException;
+use verbb\formie\Formie;
 use verbb\formie\models\IntegrationFormSettings;
+use yii\base\Exception;
 
 class WebhookFilemaker extends Webhook
 {
@@ -35,7 +41,6 @@ class WebhookFilemaker extends Webhook
     public ?string $host = null;
 
 
-
     // Public Methods
     // =========================================================================
 
@@ -48,8 +53,6 @@ class WebhookFilemaker extends Webhook
     {
         return preg_replace('#^https?://#', '', UrlHelper::hostInfo($this->webhook));
     }
-
-
 
 
     public function defineRules(): array
@@ -66,6 +69,12 @@ class WebhookFilemaker extends Webhook
         return Craft::$app->getAssetManager()->getPublishedUrl("@craftyfm/craftformiefilemaker/icon.svg", true);
     }
 
+    /**
+     * @throws SyntaxError
+     * @throws Exception
+     * @throws RuntimeError
+     * @throws LoaderError
+     */
     public function getSettingsHtml(): string
     {
 
@@ -75,6 +84,12 @@ class WebhookFilemaker extends Webhook
         ]);
     }
 
+    /**
+     * @throws SyntaxError
+     * @throws Exception
+     * @throws RuntimeError
+     * @throws LoaderError
+     */
     public function getFormSettingsHtml($form): string
     {
         return Craft::$app->getView()->renderTemplate("formie-filemaker/_formie-filemaker-form-settings", [
@@ -83,6 +98,9 @@ class WebhookFilemaker extends Webhook
         ]);
     }
 
+    /**
+     * @throws IntegrationException
+     */
     public function fetchFormSettings(): IntegrationFormSettings
     {
         $settings = [];
@@ -127,45 +145,45 @@ class WebhookFilemaker extends Webhook
         return new IntegrationFormSettings($settings);
     }
 
+    /**
+     * @throws IntegrationException
+     */
     public function sendPayload(Submission $submission): bool
     {
         $payload = [];
-        $response = [];
 
         try {
             // Either construct the payload yourself manually or get Formie to do it
             $payload = $this->generatePayloadValues($submission);
 
-            $body =  [
-                 "fieldData" => [
-                     "webhook_payload" => json_encode($payload)
-                 ]
-             ];
+            $body = [
+                "fieldData" => [
+                    "webhook_payload" => json_encode($payload)
+                ]
+            ];
 
-            $this->length = strlen(json_encode($body)) ;
+            $this->length = strlen(json_encode($body));
 
             $client = new Client();
 
-            $headers = [ 'headers' => [
-                    'Host' => $this->getHost(),
-                    'Content-Type' => 'application/json',
-                    'Content-Length' => $this->length,
-                    'Accept' => 'application/json',
-                    'Authorization' => 'Bearer ' . $this->getAuthToken()
-                ],
+            $headers = ['headers' => [
+                'Host' => $this->getHost(),
+                'Content-Type' => 'application/json',
+                'Content-Length' => $this->length,
+                'Accept' => 'application/json',
+                'Authorization' => 'Bearer ' . $this->getAuthToken()
+            ],
                 'body' => json_encode($body)
             ];
 
-            $request = $client->post($this->webhook, $headers);
-
+            $client->post($this->webhook, $headers);
         } catch (Throwable $e) {
             // Save a different payload to logs
-            Integration::error($this, Craft::t('formie', 'API error: “{message}” {file}:{line}. Payload: “{payload}”. Response: “{response}”', [
+            Integration::error($this, Craft::t('formie', 'API error: “{message}” {file}:{line}. Payload: “{payload}”', [
                 'message' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
                 'payload' => Json::encode($payload),
-                'response' => $response,
             ]));
 
             Integration::apiError($this, $e);
@@ -176,8 +194,9 @@ class WebhookFilemaker extends Webhook
         return true;
     }
 
-
-
+    /**
+     * @throws IntegrationException
+     */
     public function getClient(): Client
     {
         // We memoize the client for performance, in case we make multiple requests.
@@ -185,10 +204,10 @@ class WebhookFilemaker extends Webhook
             return $this->_client;
         }
 
-        //get or set refreshed token
+        //get or set a refreshed token
         $headers = [
             'headers' => [
-               // 'Connection' => 'keep-alive',
+                // 'Connection' => 'keep-alive',
                 'Host' => $this->getHost(),
                 'Content-Type' => 'application/json',
                 'Content-Length' => $this->length,
@@ -201,64 +220,80 @@ class WebhookFilemaker extends Webhook
         return $this->_client = Craft::createGuzzleClient($headers);
     }
 
-    public function getAuthToken()
+    /**
+     * @throws IntegrationException
+     */
+    public function getAuthToken(): ?string
     {
         try {
+            // Validate required configuration
+            if (empty($this->authUrl) || empty($this->username) || empty($this->password)) {
+                Integration::error($this, Craft::t('formie', 'Missing authentication configuration: authUrl, username, or password'));
+                return null;
+            }
 
-            $token = Craft::$app->getCache()->getOrSet('api-token', function() {
-                // Create Guzzle client
-                // file to store cookie data
+            $client = new Client([
+                'base_uri' => $this->authUrl,
+                'verify' => false
+            ]);
 
-                $client = new Client([
-                    'base_uri' => $this->authUrl,
-                    'verify' => false
+            // Create Basic Auth string
+            $basicAuthString = 'Basic ' . base64_encode($this->username . ':' . $this->password);
 
-                ]);
+            // Request token
+            $response = $client->request('POST', '', [
+                'headers' => [
+                    'Content-Type' => 'application/json',
+                    'Authorization' => $basicAuthString
+                ],
+                'body' => '',
+                'debug' => false, // Set to true only for debugging
+            ]);
 
-                //create Basic Auth string
-                $basicAuthString = 'Basic ' . base64_encode($this->username . ':' . $this->password);
+            $json = $response->getBody()->getContents();
 
-                // Request token
-                $response = $client->request('POST', '', [
-                    'headers' => [
-                        'Content-Type' => 'application/json',
-                        'Authorization' => $basicAuthString
-                    ],
-                    ['body' => ''],
-                    'debug' => true,
-                ]);
+            // Check if response is empty
+            if (empty($json)) {
+                Integration::error($this, Craft::t('formie', 'Empty response from auth endpoint'));
+                return null;
+            }
 
-                $json = $response->getBody()->getContents();
-                $data = json_decode($json);
+            $data = json_decode($json, true);
 
-                $status = $response->getStatusCode();
+            // Check for JSON decode errors
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                Integration::error($this, Craft::t('formie', 'Invalid JSON response from auth endpoint: {error}', [
+                    'error' => json_last_error_msg()
+                ]));
+                return null;
+            }
 
-                $authtoken = $data->response->token;
+            // Validate response structure and data presence
+            if (empty($data['response']['token'])) {
+                Integration::error($this, Craft::t('formie', 'Token not found in auth response or token is empty'));
+                return null;
+            }
 
-                if ($status === 200) {
-                    return $authtoken;
-                } else {
-                    return false;
-                }
-            }, 100);
+            return $data['response']['token'];
 
-            return $token;
         } catch (Throwable $e) {
             // Auth errors to log
-            Integration::error($this, Craft::t('formie', 'API error: “{message}” {file}:{line}. AuthURL: “{authurl}”. Token: “{token}”', [
+            Integration::error($this, Craft::t('formie', 'API error: "{message}" {file}:{line}. AuthURL: "{authurl}"', [
                 'message' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
-                'authurl' => $this->authUrl,
-                'token' => $this->token,
+                'authurl' => $this->authUrl ?? 'not set',
             ]));
 
             Integration::apiError($this, $e);
 
-            return false;
+            return null;
         }
     }
 
+    /**
+     * @throws IntegrationException
+     */
     public function fetchConnection(): bool
     {
         try {
@@ -268,7 +303,7 @@ class WebhookFilemaker extends Webhook
 
             $client = new Client();
 
-            $headers = [ 'headers' => [
+            $headers = ['headers' => [
                 'Host' => $this->getHost(),
                 'Accept' => 'application/json',
                 'Authorization' => 'Bearer ' . $this->getAuthToken()
@@ -284,7 +319,7 @@ class WebhookFilemaker extends Webhook
 
             $webhook_payload = $data->response->data[0]->fieldData->webhook_payload;
 
-            if($status == "OK" && $webhook_payload != null){
+            if ($status == "OK" && $webhook_payload != null) {
                 return true;
             }
 
